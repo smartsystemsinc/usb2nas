@@ -1,11 +1,5 @@
 #!/usr/bin/env perl
 
-# +------------------------------------------------------------------------------+
-# | TODO As noted by the FIXME label, it would be best to re-think the flow of   |
-# | the script so that we can stop it earlier and in a more sensible place after |
-# | the mounted drive partitions get dropped off.                                |
-# +------------------------------------------------------------------------------+
-
 # Force me to write this properly
 
 use strict;
@@ -13,13 +7,13 @@ use warnings;
 
 # Modules
 
-use Carp;                                       # Built-in
+use Carp;              # Built-in
+use Config::Simple;    # dpkg libconfig-simple-perl || cpan Config::Simple
 use English qw(-no_match_vars);                 # Built-in
 use Getopt::Long qw(:config no_ignore_case);    # Built-in
 use Pod::Usage;                                 # Built-in
 use POSIX qw(strftime);                         # Built-in
-
-use Fcntl ':flock';
+use Fcntl ':flock';                             # Built-in
 
 INIT {
     if ( !flock main::DATA, LOCK_EX | LOCK_NB ) {
@@ -32,15 +26,43 @@ INIT {
 BEGIN {
     $ENV{Smart_Comments} = " @ARGV " =~ /--debug/xms;
 }
-use Smart::Comments -ENV;    # cpanm Smart::Comments
+use Smart::Comments -ENV
+    ;    # dpkg libsmart-comments-perl || cpanm Smart::Comments
 
-our $VERSION = 0.2;
+our $VERSION = '0.3';
 
+# Set variables
+my $bakdir = '/root/backups';
+my $bakdir_full;
+my $base_device;
+my $base_dir = $ENV{'HOME'} . '/.local/share/SS/usb2nas';
+my $config   = "$base_dir/config.ini";
+my $email;
+my $real_device;
+my $real_device_base;
+my $ref_labels;
+my $ref_partitions;
+my $source_dir;
+my $symlink;
+my @symlinks;
+
+# Ensure directory exists
+if ( !-d $base_dir ) { system "mkdir -p $base_dir" and croak $ERRNO; }
+
+# Try to read in parameters from the config file
+if ( -f "$config" ) {
+    my $cfg = Config::Simple->new();
+    $cfg->read("$config") or croak $ERRNO;
+    $email = $cfg->param('email');
+}
+
+# Override paramters if entered on the command line
 GetOptions(
-    'help|h'  => \my $help,
-    'debug'   => \my $debug,     # dummy variable
-    'man'     => \my $man,
-    'version' => \my $version,
+    'help|h'    => \my $help,
+    'debug'     => \my $debug,     # dummy variable
+    'man'       => \my $man,
+    'version'   => \my $version,
+    'email|e:s' => \$email,
 
 ) or pod2usage( -verbose => 0 );
 
@@ -58,21 +80,13 @@ if ( $EFFECTIVE_USER_ID != 0 ) {
     die "This script can only run as root\n";
 }
 
-# Set variables
-my $bakdir = '/root/backups';
-my $bakdir_full;
-my $base_device;
-my $real_device;
-my $real_device_base;
-my $source_dir;
-my $symlink;
+# Verify that e-mail makes reasonable sense
+if ( $email !~ m/^\w+[@][\d[:alpha:]\-]{1,}[.]{1,}[\d[:alpha:]-]{2,6}$/xms ) {
+    croak "Invalid e-mail address syntax\n";
+}
 
-my @symlinks;
-
-my $ref_labels;
-my $ref_partitions;
-
-my $email = 'cory@smartsystemsaz.com';
+# Verify that non-core external programs are installed
+check_external_programs();
 
 # Get symlinks
 get_symlinks();
@@ -95,17 +109,22 @@ get_symlinks();
 
 goto LOOP;
 
+# Subprocedures
+
 sub main {
 
     $symlink = shift or croak "Missing paramter - safety symlink\n";
     chomp $symlink;
     ### $symlink
-    $base_device = substr $symlink, -3;    # Returns e.g. sdg
+    # Base device should be e.g. 'sda'
+    ($base_device) = ( $symlink =~ /( sd[[:lower:]])/xms );
     ### $base_device
+    # Real device should be e.g. /sys/block/sda but need to make sure
     $real_device_base = `readlink /sys/block/$base_device`;
     chomp $real_device_base;
     ### $real_device_base
-    $real_device = '/sys' . substr $real_device_base, -10;
+    ($real_device) = ( $real_device_base =~ /( \/block\/sd[[:lower:]])/xms );
+    $real_device = '/sys' . $real_device;
     chomp $real_device;
     ### $real_device
 
@@ -113,6 +132,26 @@ sub main {
 
     backup();
 
+    return 0;
+}
+
+sub check_external_programs {
+
+    if ( `which rsync` eq q{} ) {
+        print "rsync not found. Attempting to install.\n" or croak $ERRNO;
+        system 'sudo apt-get install rsync --yes' and croak $ERRNO;
+    }
+
+    if ( `which mail` eq q{} ) {
+        print "heirloom-mailx not found. Attempting to install.\n"
+            or croak $ERRNO;
+        system 'sudo apt-get install heirloom-mailx --yes' and croak $ERRNO;
+    }
+
+    if ( `which msmtp` eq q{} ) {
+        print "msmtp not found. Attempting to install.\n" or croak $ERRNO;
+        system 'sudo apt-get install msmtp --yes' and croak $ERRNO;
+    }
     return 0;
 }
 
@@ -140,9 +179,10 @@ sub verify {
         ### $ref_partitions
     }
     else {
+        system "rm /dev/$symlink" and croak $ERRNO;
         print "Not using SD driver and/or a USB disk of sufficient capacity\n"
             or croak $ERRNO;
-        exit;
+        next;
     }
     return 0;
 }
@@ -208,8 +248,8 @@ sub get_label {
 }
 
 sub get_serial {
-    my $serial
-        = `udevadm info --query=all --path=/sys/block/$base_device | grep ID_SERIAL_SHORT | grep -o =.* | sed 's/.*=//'`;
+    my $serial = `udevadm info --query=all --path=/sys/block/$base_device`;
+    ($serial) = ( $serial =~ /ID_SERIAL_SHORT=(.*?)\n/xms );
     return $serial;
 }
 
@@ -234,30 +274,30 @@ ITERATION:
         $local_symlink =~ s/safety.*/safety$partition/xms;
         $local_symlink = "/dev/$local_symlink";
 
-        # FIXME We really need a better way to handle the flow
-        # of the program; it should stop this earlier if possible
-        if ( !-e $local_symlink ) {
-            print "Finished\n" or croak $ERRNO;
-            exit;
-        }
+        # # FIXME We really need a better way to handle the flow
+        # # of the program; it should stop this earlier if possible
+        # if ( !-e $local_symlink ) {
+        #     print "Finished\n" or croak $ERRNO;
+        #     exit;
+        # }
 
         ### $source_dir
         ### $local_symlink
-        my $log = '/home/cory/Desktop/usb.txt';
-        open my $OUTPUT, '>>', "$log"
-            or croak "Unable to open log file $log\n";
-        print {$OUTPUT} "$symlink\n"     or croak $ERRNO;
-        print {$OUTPUT} "$bakdir_full\n" or croak $ERRNO;
-        close $OUTPUT or croak "Unable to close log file $log\n";
-        system "mkdir -p $bakdir_full";
+        # my $log = '/home/cory/Desktop/usb.txt';
+        # open my $OUTPUT, '>>', "$log"
+        #     or croak "Unable to open log file $log\n";
+        # print {$OUTPUT} "$symlink\n"     or croak $ERRNO;
+        # print {$OUTPUT} "$bakdir_full\n" or croak $ERRNO;
+        # close $OUTPUT or croak "Unable to close log file $log\n";
+        system "mkdir -p $bakdir_full" and croak $ERRNO;
 
-        mkdir $source_dir;
+        if ( !-d $source_dir ) { mkdir $source_dir or croak $ERRNO; }
         system "mount $local_symlink $source_dir";
         sleep 2;
         system
 
             # Mind the trailing / at the end of $source_dir
-            "rsync --archive --checksum --verbose \"$source_dir/\" \"$bakdir_full\" 2>&1";
+            "rsync --archive --verbose \"$source_dir/\" \"$bakdir_full\" 2>&1";
         my $rsync_status_return = $CHILD_ERROR >> 8;
         my $rsync_status_error  = $ERRNO;
         my $rsync_output;
@@ -273,11 +313,13 @@ ITERATION:
         }
 
         # NOTE: This seems to remove the safety symlink as well
-        system "umount $source_dir";
-        system "rmdir $source_dir";
+        system "umount $source_dir" and croak $ERRNO;
+        system "rmdir $source_dir"  and croak $ERRNO;
+        system "rm /dev/$symlink"   and croak $ERRNO;
         my $cur_time = strftime '%c', localtime;
         system
-            "echo \"Backup complete. Rsync output: $rsync_output\" | mail -s \"Backup report from $source_dir at $cur_time\" $email";
+            "echo \"Backup complete. Rsync output: $rsync_output\" | mail -s \"Backup report from $source_dir at $cur_time\" $email"
+            and croak $ERRNO;
 
         next ITERATION;
     }
@@ -291,6 +333,12 @@ __END__
 =begin comment
 
 Changelog:
+
+0.3:
+    -Refactored based on improvements made in ssbak2bak v0.1
+    -Added a configuration file as a result; currently just stores the e-mail address
+    -Added basic checks for installed utility programs
+    -Improved the documentation
 
 0.2:
     -Refactored to ensure all eligible drives are dealt with, even if they're
@@ -321,6 +369,7 @@ usb2nas -- Backs up to an external device based on a udev rule
         --debug         Enables debug mode
         --man           Displays the full embedded manual
         --version       Displays the version and then exits
+    -e, --email         E-mail address to send reports to
 
 =head1 DESCRIPTION
 
@@ -333,18 +382,19 @@ L<CONFIGURATION|CONFIGURATION>.
 
 =head1 REQUIRED ARGUMENTS
 
-None.
+Requires an e-mail address, as detailed in L<USAGE|USAGE>.
 
 =head1 OPTIONS
 
-See L<USAGE|USAGE>. There's really nothing to configure here at the moment.
+See L<USAGE|USAGE>. There's really nothing to configure here at the moment
+aside from local debug output.
 
 =head1 DIAGNOSTICS
 
-Should the script not be working, ensure you're running it as root or via sudo;
-other configurations may not work. Otherwise, ensure that your .msmtprc, your
-~/.mailrc, and your udev rule are configured correctly; ensure also that
-L<rsync(1)|rsync(1)> is installed correctly.
+Ensure that your .msmtprc, your ~/.mailrc, and your udev rule are configured
+correctly; ensure also that L<rsync(1)|rsync(1)> is installed correctly.
+Sample configurations for the udev rule and msmtp are provided below. Don't
+forget to chmod ~/.msmtprc to 600 (r-w only for the user)
 
 Failing all of that, ensure that the partition to be backed up has a label. Any
 label. Labels are part of the backup path, to help keep it human-readable.
@@ -356,27 +406,46 @@ or for other issues which will be present in the output.
 
 =head1 CONFIGURATION
 
-/etc/udev/rules.d/backup.rules:
+Sample /etc/udev/rules.d/backup.rules:
 
     # Backup rules
-    SUBSYSTEM=="block", ACTION=="add", SYMLINK+="safety%k"
-    SUBSYSTEM=="block", ACTION=="add", RUN+="/home/cory/.local/bin/uuid/uuidBackup.pl | at now"
+    SUBSYSTEM=="block", ACTION=="add", KERNEL=="sd*", SYMLINK+="safety%k"
+    SUBSYSTEM=="block", ACTION=="add", RUN+="/home/foo/.local/bin/usb2nas/usb2nas.pl | at now"
 
 What this does is check for any drive that is successfully added, then creates
 a symlink to it and every partition on it for safety's sake. It then runs the
-script explicitly, piping the whole thing into L<at(1)|at(1)> to avoid blocking udev.
-Note that this rule will run for every partition on the drive; for that reason,
-this script will only allow itself to be started once, using Fcntl ':flock'.
+script explicitly, piping the whole thing into L<at(1)|at(1)> to avoid blocking
+udev. Note that this rule will run for every partition on the drive; for that
+reason, this script will only allow itself to be started once, using
+Fcntl ':flock'.
 
-It also requires e-mail to be configured, specifically requiring L<mail(1)|mail(1)> and
-L<msmtp(1)|msmtp(1)>. You'll need to add 'set sendmail="/usr/bin/msmtp"' to your ~/.mailrc
-or /etc/mailrc as well.
+It also requires e-mail to be configured, specifically requiring
+L<mail(1)|mail(1)> and L<msmtp(1)|msmtp(1)>. You'll need to add 'set
+sendmail="/usr/bin/msmtp"' to your ~/.mailrc or /etc/mailrc as well.
+For reference, here's a sample .msmtprc:
+
+    account Test
+    host 10.100.100.115
+    port 1025
+    protocol smtp
+    from foo@mycompany.com
+    auth login
+    user foo.bar
+    password mySecurePass123
+    logfile ~/.msmtp.test.log
+    account default: Test
+
+For convenience, all of the required parameters can be put into a simple INI
+config file in '$HOME/.local/share/SS/usb2nas', e.g.:
+
+    email=foo@mycompany.com
 
 =head1 DEPENDENCIES
 
 Perl:
 
     -Perl of a recent vintage (developed on 5.18.2)
+    -Config::Simple; (cpan Config::Simple or dpkg libconfig-simple-perl)
     -Smart::Comments (cpanm Smart::Comments or dpkg libsmart-comments-perl)
         -The call for this can be commented out at the top of the script if
          this functionality is unneeded
@@ -388,7 +457,7 @@ External:
     -mail (heirloom-mailx)
     -msmtp (msmtp)
     -udev (udev)
-    -udev rule (see L<CONFIGURATION|CONFIGURATION>)
+    -udev rule
 
 =head1 INCOMPATIBILITIES
 
@@ -407,6 +476,19 @@ Cory Sadowski <cory@smartsystemsaz.com>
 
 =head1 LICENSE AND COPYRIGHT
 
-To be determined.
+(c) 2015 SmartSystems, Inc.
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 =cut
